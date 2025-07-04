@@ -30,8 +30,7 @@ export default function DrawingCanvas({
   const [shapes, setShapes] = useState<DrawShape[]>([]);
   const [texts, setTexts] = useState<DrawText[]>([]);
   const [cursors, setCursors] = useState<Map<string, CursorPosition>>(new Map());
-  const [undoStack, setUndoStack] = useState<any[]>([]);
-  const [redoStack, setRedoStack] = useState<any[]>([]);
+  const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const { socket } = useSocket();
 
   // Initialize canvas and socket listeners
@@ -46,8 +45,15 @@ export default function DrawingCanvas({
 
     // Set canvas size
     const resizeCanvas = () => {
-      canvas.width = canvas.offsetWidth;
-      canvas.height = canvas.offsetHeight;
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      
+      ctx.scale(dpr, dpr);
+      
+      setCanvasSize({ width: rect.width, height: rect.height });
       redrawCanvas();
     };
 
@@ -63,8 +69,6 @@ export default function DrawingCanvas({
     socket.on('board-cleared', handleBoardClear);
     socket.on('board-state', handleBoardState);
     socket.on('cursor-move', handleCursorMove);
-    socket.on('undo', handleRemoteUndo);
-    socket.on('redo', handleRemoteRedo);
 
     return () => {
       window.removeEventListener('resize', resizeCanvas);
@@ -76,18 +80,16 @@ export default function DrawingCanvas({
       socket.off('board-cleared', handleBoardClear);
       socket.off('board-state', handleBoardState);
       socket.off('cursor-move', handleCursorMove);
-      socket.off('undo', handleRemoteUndo);
-      socket.off('redo', handleRemoteRedo);
     };
-  }, [socket, paths, shapes, texts]);
+  }, [socket]);
 
   // Socket event handlers
   const handleRemoteDrawStart = (data: any) => {
-    // Handle remote drawing start
+    // Handle remote drawing start if needed
   };
 
   const handleRemoteDrawMove = (data: any) => {
-    // Handle remote drawing move
+    // Handle remote drawing move if needed
   };
 
   const handleRemoteDrawEnd = (data: any) => {
@@ -97,7 +99,8 @@ export default function DrawingCanvas({
       color: data.path.color,
       width: data.path.width,
       tool: data.path.tool,
-      timestamp: new Date()
+      timestamp: new Date(),
+      userId: data.userId
     };
     setPaths(prev => [...prev, newPath]);
   };
@@ -110,7 +113,8 @@ export default function DrawingCanvas({
       endPoint: data.shape.endPoint,
       color: data.shape.color,
       width: data.shape.width,
-      timestamp: new Date()
+      timestamp: new Date(),
+      userId: data.userId
     };
     setShapes(prev => [...prev, newShape]);
   };
@@ -123,7 +127,9 @@ export default function DrawingCanvas({
       color: data.text.color,
       fontSize: data.text.fontSize,
       fontFamily: data.text.fontFamily,
-      timestamp: new Date()
+      timestamp: new Date(),
+      userId: data.userId,
+      isEditable: false
     };
     setTexts(prev => [...prev, newText]);
   };
@@ -132,8 +138,6 @@ export default function DrawingCanvas({
     setPaths([]);
     setShapes([]);
     setTexts([]);
-    setUndoStack([]);
-    setRedoStack([]);
   };
 
   const handleBoardState = (boardData: any) => {
@@ -153,18 +157,12 @@ export default function DrawingCanvas({
     setTimeout(() => {
       setCursors(prev => {
         const newCursors = new Map(prev);
-        newCursors.delete(data.userId);
+        if (newCursors.get(data.userId)?.timestamp === data.timestamp) {
+          newCursors.delete(data.userId);
+        }
         return newCursors;
       });
     }, 3000);
-  };
-
-  const handleRemoteUndo = () => {
-    // Handle remote undo
-  };
-
-  const handleRemoteRedo = () => {
-    // Handle remote redo
   };
 
   // Drawing functions
@@ -183,6 +181,7 @@ export default function DrawingCanvas({
   };
 
   const startDrawing = (e: React.MouseEvent | React.TouchEvent) => {
+    e.preventDefault();
     const point = getPointFromEvent(e);
     setIsDrawing(true);
     setStartPoint(point);
@@ -200,6 +199,7 @@ export default function DrawingCanvas({
   };
 
   const draw = (e: React.MouseEvent | React.TouchEvent) => {
+    e.preventDefault();
     if (!isDrawing) return;
 
     const point = getPointFromEvent(e);
@@ -218,18 +218,20 @@ export default function DrawingCanvas({
     drawLine(point);
   };
 
-  const stopDrawing = () => {
+  const stopDrawing = (e?: React.MouseEvent | React.TouchEvent) => {
+    if (e) e.preventDefault();
     if (!isDrawing) return;
     setIsDrawing(false);
 
-    if (tool === 'pen' || tool === 'eraser') {
+    if (tool === 'pen' || tool === 'eraser' || tool === 'highlighter') {
       const newPath: DrawPath = {
         id: uuidv4(),
         points: currentPath,
         color: tool === 'eraser' ? '#FFFFFF' : color,
         width: brushSize,
         tool,
-        timestamp: new Date()
+        timestamp: new Date(),
+        userId: 'local'
       };
 
       setPaths(prev => [...prev, newPath]);
@@ -240,7 +242,7 @@ export default function DrawingCanvas({
           path: newPath
         });
       }
-    } else if (startPoint && currentPath.length > 0) {
+    } else if ((tool === 'rectangle' || tool === 'circle' || tool === 'line' || tool === 'arrow' || tool === 'triangle' || tool === 'diamond') && startPoint && currentPath.length > 0) {
       const endPoint = currentPath[currentPath.length - 1];
       const newShape: DrawShape = {
         id: uuidv4(),
@@ -249,7 +251,8 @@ export default function DrawingCanvas({
         endPoint,
         color,
         width: brushSize,
-        timestamp: new Date()
+        timestamp: new Date(),
+        userId: 'local'
       };
 
       setShapes(prev => [...prev, newShape]);
@@ -273,9 +276,17 @@ export default function DrawingCanvas({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over';
+    if (tool === 'highlighter') {
+      ctx.globalCompositeOperation = 'multiply';
+      ctx.globalAlpha = 0.3;
+    } else {
+      ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over';
+      ctx.globalAlpha = 1;
+    }
+
     ctx.lineWidth = brushSize;
     ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
     ctx.strokeStyle = color;
 
     if (currentPath.length > 1) {
@@ -301,9 +312,17 @@ export default function DrawingCanvas({
     paths.forEach(path => {
       if (path.points.length < 2) return;
 
-      ctx.globalCompositeOperation = path.tool === 'eraser' ? 'destination-out' : 'source-over';
+      if (path.tool === 'highlighter') {
+        ctx.globalCompositeOperation = 'multiply';
+        ctx.globalAlpha = 0.3;
+      } else {
+        ctx.globalCompositeOperation = path.tool === 'eraser' ? 'destination-out' : 'source-over';
+        ctx.globalAlpha = 1;
+      }
+
       ctx.lineWidth = path.width;
       ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
       ctx.strokeStyle = path.color;
 
       ctx.beginPath();
@@ -317,6 +336,7 @@ export default function DrawingCanvas({
     // Draw shapes
     shapes.forEach(shape => {
       ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1;
       ctx.lineWidth = shape.width;
       ctx.strokeStyle = shape.color;
 
@@ -341,6 +361,15 @@ export default function DrawingCanvas({
           ctx.moveTo(shape.startPoint.x, shape.startPoint.y);
           ctx.lineTo(shape.endPoint.x, shape.endPoint.y);
           break;
+        case 'arrow':
+          drawArrow(ctx, shape.startPoint, shape.endPoint);
+          break;
+        case 'triangle':
+          drawTriangle(ctx, shape.startPoint, shape.endPoint);
+          break;
+        case 'diamond':
+          drawDiamond(ctx, shape.startPoint, shape.endPoint);
+          break;
       }
       ctx.stroke();
     });
@@ -348,6 +377,7 @@ export default function DrawingCanvas({
     // Draw texts
     texts.forEach(text => {
       ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1;
       ctx.fillStyle = text.color;
       ctx.font = `${text.fontSize}px ${text.fontFamily}`;
       ctx.fillText(text.text, text.position.x, text.position.y);
@@ -355,9 +385,17 @@ export default function DrawingCanvas({
 
     // Draw current path
     if (isDrawing && currentPath.length > 1) {
-      ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over';
+      if (tool === 'highlighter') {
+        ctx.globalCompositeOperation = 'multiply';
+        ctx.globalAlpha = 0.3;
+      } else {
+        ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over';
+        ctx.globalAlpha = 1;
+      }
+
       ctx.lineWidth = brushSize;
       ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
       ctx.strokeStyle = color;
 
       ctx.beginPath();
@@ -367,7 +405,93 @@ export default function DrawingCanvas({
       });
       ctx.stroke();
     }
-  }, [paths, shapes, texts, currentPath, isDrawing, tool, color, brushSize]);
+
+    // Draw current shape preview
+    if (isDrawing && startPoint && currentPath.length > 0 && 
+        (tool === 'rectangle' || tool === 'circle' || tool === 'line' || tool === 'arrow' || tool === 'triangle' || tool === 'diamond')) {
+      const endPoint = currentPath[currentPath.length - 1];
+      
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = brushSize;
+      ctx.strokeStyle = color;
+
+      ctx.beginPath();
+      switch (tool) {
+        case 'rectangle':
+          ctx.rect(
+            startPoint.x,
+            startPoint.y,
+            endPoint.x - startPoint.x,
+            endPoint.y - startPoint.y
+          );
+          break;
+        case 'circle':
+          const radius = Math.sqrt(
+            Math.pow(endPoint.x - startPoint.x, 2) +
+            Math.pow(endPoint.y - startPoint.y, 2)
+          );
+          ctx.arc(startPoint.x, startPoint.y, radius, 0, 2 * Math.PI);
+          break;
+        case 'line':
+          ctx.moveTo(startPoint.x, startPoint.y);
+          ctx.lineTo(endPoint.x, endPoint.y);
+          break;
+        case 'arrow':
+          drawArrow(ctx, startPoint, endPoint);
+          break;
+        case 'triangle':
+          drawTriangle(ctx, startPoint, endPoint);
+          break;
+        case 'diamond':
+          drawDiamond(ctx, startPoint, endPoint);
+          break;
+      }
+      ctx.stroke();
+    }
+  }, [paths, shapes, texts, currentPath, isDrawing, tool, color, brushSize, startPoint]);
+
+  // Helper functions for drawing shapes
+  const drawArrow = (ctx: CanvasRenderingContext2D, start: Point, end: Point) => {
+    const headLength = 20;
+    const angle = Math.atan2(end.y - start.y, end.x - start.x);
+
+    ctx.moveTo(start.x, start.y);
+    ctx.lineTo(end.x, end.y);
+
+    ctx.lineTo(
+      end.x - headLength * Math.cos(angle - Math.PI / 6),
+      end.y - headLength * Math.sin(angle - Math.PI / 6)
+    );
+    ctx.moveTo(end.x, end.y);
+    ctx.lineTo(
+      end.x - headLength * Math.cos(angle + Math.PI / 6),
+      end.y - headLength * Math.sin(angle + Math.PI / 6)
+    );
+  };
+
+  const drawTriangle = (ctx: CanvasRenderingContext2D, start: Point, end: Point) => {
+    const width = end.x - start.x;
+    const height = end.y - start.y;
+
+    ctx.moveTo(start.x + width / 2, start.y);
+    ctx.lineTo(start.x, end.y);
+    ctx.lineTo(end.x, end.y);
+    ctx.closePath();
+  };
+
+  const drawDiamond = (ctx: CanvasRenderingContext2D, start: Point, end: Point) => {
+    const centerX = (start.x + end.x) / 2;
+    const centerY = (start.y + end.y) / 2;
+    const width = Math.abs(end.x - start.x) / 2;
+    const height = Math.abs(end.y - start.y) / 2;
+
+    ctx.moveTo(centerX, start.y);
+    ctx.lineTo(end.x, centerY);
+    ctx.lineTo(centerX, end.y);
+    ctx.lineTo(start.x, centerY);
+    ctx.closePath();
+  };
 
   useEffect(() => {
     redrawCanvas();
@@ -378,7 +502,10 @@ export default function DrawingCanvas({
       const point = getPointFromEvent(e);
       socket.emit('cursor-move', {
         roomId,
-        position: point
+        position: point,
+        tool,
+        color,
+        timestamp: Date.now()
       });
     }
 
@@ -397,9 +524,11 @@ export default function DrawingCanvas({
           text,
           position: point,
           color,
-          fontSize: brushSize * 4,
+          fontSize: Math.max(brushSize * 4, 16),
           fontFamily: 'Arial',
-          timestamp: new Date()
+          timestamp: new Date(),
+          userId: 'local',
+          isEditable: false
         };
 
         setTexts(prev => [...prev, newText]);
@@ -414,11 +543,30 @@ export default function DrawingCanvas({
     }
   };
 
+  const getCursorStyle = () => {
+    switch (tool) {
+      case 'pen':
+      case 'highlighter':
+        return 'crosshair';
+      case 'eraser':
+        return 'grab';
+      case 'text':
+        return 'text';
+      case 'hand':
+        return 'grab';
+      case 'select':
+        return 'default';
+      default:
+        return 'crosshair';
+    }
+  };
+
   return (
-    <div className="relative w-full h-full">
+    <div className="relative w-full h-full overflow-hidden">
       <canvas
         ref={canvasRef}
-        className="absolute inset-0 w-full h-full cursor-crosshair bg-white"
+        className="absolute inset-0 w-full h-full bg-white"
+        style={{ cursor: getCursorStyle() }}
         onMouseDown={startDrawing}
         onMouseMove={handleMouseMove}
         onMouseUp={stopDrawing}
@@ -433,16 +581,20 @@ export default function DrawingCanvas({
       {Array.from(cursors.entries()).map(([userId, cursor]) => (
         <div
           key={userId}
-          className="absolute pointer-events-none z-10"
+          className="absolute pointer-events-none z-10 transition-all duration-100"
           style={{
             left: cursor.position.x,
             top: cursor.position.y,
-            transform: 'translate(-50%, -50%)'
+            transform: 'translate(-50%, -100%)'
           }}
         >
-          <div className="bg-blue-500 text-white px-2 py-1 rounded text-xs">
+          <div className="bg-blue-500 text-white px-2 py-1 rounded text-xs shadow-lg">
             {cursor.username}
           </div>
+          <div 
+            className="w-3 h-3 rounded-full border-2 border-white shadow-md"
+            style={{ backgroundColor: cursor.color || '#3b82f6' }}
+          />
         </div>
       ))}
     </div>
